@@ -9,10 +9,12 @@
  *   - ISteamUserStats/GetSchemaForGame       achievement definitions
  *   - ISteamUserStats/GetPlayerAchievements  per-player unlock status
  *   - ISteamUserStats/GetGlobalAchievementPercentagesForApp  rarity
- *   - ISteamApps/GetAppList                  full appid <-> name map (no key)
+ *   - IStoreService/GetAppList               full appid <-> name map
+ *   - IWishlistService/GetWishlist           wishlist appids (no key)
+ *   - IStoreBrowseService/GetItems           store name/price/discount (no key)
  *
- * Most calls need the API key (STEAM_API_KEY); GetAppList and the global
- * percentages endpoint are public.
+ * Most calls need the API key (STEAM_API_KEY); the global percentages,
+ * wishlist and store-items endpoints are public.
  */
 
 import { cached, TTL } from "./cache.js";
@@ -323,4 +325,100 @@ export async function getAppList(): Promise<AppListEntry[]> {
     },
     true, // persist to disk — it's big and slow to fetch
   );
+}
+
+// --- Wishlist ---------------------------------------------------------------
+
+export interface WishlistItem {
+  appid: number;
+  /** User-set order; 0 = not ranked (Steam puts these after the ranked ones). */
+  priority: number;
+  date_added: number; // unix seconds
+}
+
+interface WishlistResponse {
+  response: { items?: WishlistItem[] };
+}
+
+/**
+ * The player's wishlist: appid + priority + date added, no names or prices.
+ * Public endpoint (no key), but the wishlist itself must be visible — it follows
+ * the profile's "game details" privacy setting.
+ */
+export async function getWishlist(steamId: string): Promise<WishlistItem[]> {
+  return cached(`wishlist:${steamId}`, TTL.player, async () => {
+    const data = await get<WishlistResponse>("IWishlistService/GetWishlist/v1/", {
+      steamid: steamId,
+    });
+    // A private wishlist comes back as an empty response, same as an empty one.
+    return data.response.items ?? [];
+  });
+}
+
+/** Store country for prices (ISO 3166-1 alpha-2). Steam returns nothing without one. */
+export function country(): string {
+  return process.env.STEAM_COUNTRY?.trim().toUpperCase() || "US";
+}
+
+export interface StoreItem {
+  appid: number;
+  name?: string;
+  /** 0 game, 1 demo, 4 DLC, … (absent when the store page is gone). */
+  type?: number;
+  /** 1 = ok; anything else = not sold in this country / delisted. */
+  success: number;
+  visible?: boolean;
+  store_url_path?: string;
+  release?: { steam_release_date?: number; is_coming_soon?: boolean; coming_soon_display?: string };
+  reviews?: {
+    summary_filtered?: { review_count?: number; percent_positive?: number; review_score_label?: string };
+  };
+  is_free?: boolean;
+  best_purchase_option?: {
+    final_price_in_cents?: string;
+    original_price_in_cents?: string;
+    formatted_final_price?: string;
+    formatted_original_price?: string;
+    discount_pct?: number;
+    active_discounts?: { discount_end_date?: number }[];
+  };
+}
+
+interface StoreItemsResponse {
+  response: { store_items?: StoreItem[] };
+}
+
+/** Max ids per IStoreBrowseService/GetItems call (it's a GET, so the URL caps it). */
+const STORE_BATCH = 200;
+
+/**
+ * Store details (name, type, price, discount, release, reviews) for many apps.
+ * Public endpoint. Ids are sorted before batching so repeat calls with the same
+ * set hit the same cache keys.
+ */
+export async function getStoreItems(appids: number[]): Promise<Map<number, StoreItem>> {
+  const ids = [...new Set(appids)].sort((a, b) => a - b);
+  const cc = country();
+  const language = lang();
+  const batches: number[][] = [];
+  for (let i = 0; i < ids.length; i += STORE_BATCH) batches.push(ids.slice(i, i + STORE_BATCH));
+
+  const results = await Promise.all(
+    batches.map((batch) =>
+      cached(`store:${cc}:${language}:${batch[0]}-${batch.at(-1)}:${batch.length}`, TTL.store, async () => {
+        const data = await get<StoreItemsResponse>("IStoreBrowseService/GetItems/v1/", {
+          input_json: JSON.stringify({
+            ids: batch.map((appid) => ({ appid })),
+            context: { language, country_code: cc },
+            data_request: { include_release: true, include_reviews: true },
+          }),
+        });
+        return data.response.store_items ?? [];
+      }),
+    ),
+  );
+
+  const map = new Map<number, StoreItem>();
+  for (const item of results.flat()) map.set(item.appid, item);
+  return map;
 }

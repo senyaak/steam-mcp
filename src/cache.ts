@@ -32,6 +32,10 @@ export const TTL = {
   globals: 6 * 60 * 60 * 1000,
   /** The full Steam app list — huge and slow; refresh daily. */
   applist: 24 * 60 * 60 * 1000,
+  /** Store prices/discounts — sales start and end, so keep it short. */
+  store: 60 * 60 * 1000,
+  /** GG.deals prices — the API budget is tiny (1000 games/hour), so hold them a while. */
+  ggdeals: 6 * 60 * 60 * 1000,
 } as const;
 
 /** Cache directory. Read lazily so a CACHE_DIR set via .env is honoured. */
@@ -125,6 +129,24 @@ export function cached<T>(
 
   store.set(key, { promise, expires });
   return promise;
+}
+
+/** Lookup of a resolved, unexpired value; undefined on miss. */
+export async function peek<T>(key: string): Promise<T | undefined> {
+  const hit = store.get(key);
+  if (!hit || hit.expires <= Date.now()) return undefined;
+  try {
+    return (await hit.promise) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Store an already-known value (e.g. one item out of a batch response). */
+export function put<T>(key: string, ttlMs: number, value: T, persist = false): void {
+  const expires = ttlMs >= NEVER ? NEVER : Date.now() + ttlMs;
+  store.set(key, { promise: Promise.resolve(value), expires });
+  if (persist) persistToDisk(key, expires, value);
 }
 
 export function cacheStats(): { entries: number } {

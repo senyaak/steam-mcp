@@ -11,6 +11,9 @@
  *   get_recently_played_games  games played in the last 2 weeks
  *   find_game                  appid by game name (cached Steam app list)
  *   get_player_achievements    per-game achievements: status + rarity + hints
+ *   get_wishlist               wishlist with prices, discounts, release, reviews
+ *                              (+ GG.deals retail/keyshop prices and lows)
+ *   get_game_deals             GG.deals prices for any appids
  *
  * Requires env STEAM_API_KEY (https://steamcommunity.com/dev/apikey).
  * Listens on PORT (default 3846) at /mcp; health check at /health.
@@ -41,14 +44,21 @@ import {
   getPlayerAchievements,
   getPlayerSummary,
   getRecentlyPlayedGames,
+  getStoreItems,
+  getWishlist,
   looksLikeSteamId,
   parseVanity,
   resolveVanityUrl,
   SteamApiError,
+  country,
   type AppListEntry,
 } from "./steam.js";
+import { getGgPrices, ggApiKey, ggRegion } from "./ggdeals.js";
 import {
   distillGame,
+  distillGg,
+  distillWishlistItem,
+  type DistilledWishlistItem,
   mergeAchievements,
   pct,
   type MergedAchievement,
@@ -404,6 +414,153 @@ function registerTools(server: McpServer): void {
       }
     },
   );
+  server.registerTool(
+    "get_wishlist",
+    {
+      title: "Get wishlist",
+      description:
+        "List the games on a player's Steam wishlist with store details: current price, discount % " +
+        "and when the sale ends, release date (or coming soon), review score, the player's priority " +
+        "and the date added. Prices are in the store currency of STEAM_COUNTRY. Use on_sale_only " +
+        "or sort='discount' for 'what's on sale from my wishlist'. Requires the profile's game " +
+        "details to be Public.",
+      inputSchema: {
+        steam_id: steamIdSchema,
+        sort: z
+          .enum(["priority", "added", "name", "price", "discount"])
+          .default("priority")
+          .describe(
+            "Sort: priority (the player's own ranking, unranked last), added (newest first), " +
+              "name (A→Z), price (cheapest first, unpriced last), discount (biggest first).",
+          ),
+        on_sale_only: z.boolean().default(false).describe("Only include discounted items."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(2000)
+          .default(50)
+          .describe("Max items to return (1-2000)."),
+        gg_deals: z
+          .boolean()
+          .default(true)
+          .describe(
+            "Add GG.deals prices (cheapest official store, cheapest keyshop, all-time lows) to the " +
+              "returned items. Needs GG_DEALS_API_KEY. Budget is 100 games/min, 1000/hour (cached " +
+              "6h) — keep limit small when this is on; items over budget come back without ggDeals.",
+          ),
+      },
+    },
+    async ({ steam_id, sort, on_sale_only, limit, gg_deals }) => {
+      try {
+        const steamId = resolveSteamId(steam_id);
+        const wishlist = await getWishlist(steamId);
+        if (!wishlist.length) {
+          return asText({
+            steamId,
+            totalItems: 0,
+            note: "Wishlist is empty or private (it follows the profile's game details privacy setting).",
+            items: [],
+          });
+        }
+        // Store details are best-effort: without them we still return appids + dates.
+        const store = await getStoreItems(wishlist.map((w) => w.appid)).catch(
+          () => new Map(),
+        );
+        let items: DistilledWishlistItem[] = wishlist.map((w) =>
+          distillWishlistItem(w, store.get(w.appid)),
+        );
+        const total = items.length;
+        const onSale = items.filter((i) => i.discountPct).length;
+        if (on_sale_only) items = items.filter((i) => i.discountPct);
+
+        if (sort === "added") {
+          items.sort((a, b) => b.added.localeCompare(a.added));
+        } else if (sort === "name") {
+          items.sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
+        } else if (sort === "price") {
+          items.sort((a, b) => (a.priceCents ?? Infinity) - (b.priceCents ?? Infinity));
+        } else if (sort === "discount") {
+          items.sort((a, b) => (b.discountPct ?? 0) - (a.discountPct ?? 0));
+        } else {
+          // priority: 1, 2, 3, … then unranked (0), newest first.
+          items.sort(
+            (a, b) =>
+              (a.priority || Infinity) - (b.priority || Infinity) || b.added.localeCompare(a.added),
+          );
+        }
+
+        const page = items.slice(0, limit);
+        let ggNote: string | undefined;
+        if (gg_deals && ggApiKey()) {
+          try {
+            const gg = await getGgPrices(page.map((i) => i.appid));
+            for (const item of page) {
+              const p = gg.prices.get(item.appid);
+              if (p !== undefined) item.ggDeals = p && distillGg(p);
+            }
+            if (gg.skipped.length) {
+              ggNote = `GG.deals rate limit: ${gg.skipped.length} items have no ggDeals yet — ask again in a minute.`;
+            }
+          } catch (err) {
+            ggNote = `GG.deals unavailable: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+
+        return asText({
+          steamId,
+          country: country(),
+          totalItems: total,
+          onSale,
+          storeDetails: store.size > 0,
+          ...(gg_deals && ggApiKey() ? { ggDealsRegion: ggRegion(), ggDealsNote: ggNote } : {}),
+          returned: page.length,
+          items: page,
+        });
+      } catch (err) {
+        return asError(err);
+      }
+    },
+  );
+  server.registerTool(
+    "get_game_deals",
+    {
+      title: "Get best prices across stores (GG.deals)",
+      description:
+        "For up to 100 Steam appids, get GG.deals price data: the cheapest current price in " +
+        "official stores (Steam, GOG, Humble, Fanatical, …) and in keyshops (grey-market key " +
+        "resellers), plus all-time lows for both. Use it to judge whether a price is good or to " +
+        "find a cheaper place to buy. Data from GG.deals; needs GG_DEALS_API_KEY. Budget: 100 " +
+        "games/minute, 1000/hour, cached 6h.",
+      inputSchema: {
+        appids: z
+          .array(z.number().int())
+          .min(1)
+          .max(100)
+          .describe("Steam appids (get them from get_wishlist, get_owned_games or find_game)."),
+      },
+    },
+    async ({ appids }) => {
+      try {
+        const gg = await getGgPrices(appids);
+        return asText({
+          source: "GG.deals",
+          region: ggRegion(),
+          games: appids.map((appid) => {
+            const p = gg.prices.get(appid);
+            if (p === undefined) return { appid, pending: true };
+            if (p === null) return { appid, found: false };
+            return { appid, title: p.title, ...distillGg(p) };
+          }),
+          ...(gg.skipped.length
+            ? { note: `Rate limit reached: ${gg.skipped.length} appids not fetched — retry in a minute.` }
+            : {}),
+        });
+      } catch (err) {
+        return asError(err);
+      }
+    },
+  );
 }
 
 function createServer(): McpServer {
@@ -415,7 +572,9 @@ function createServer(): McpServer {
         "If you don't have a SteamID64, call resolve_steam_id with a vanity name or profile URL. " +
         "Use get_owned_games / get_recently_played_games to see what they play, find_game to turn a " +
         "name into an appid, and get_player_achievements (filter='locked', sort='rarity') to find the " +
-        "easiest achievements left to unlock and advise on them. steam_id defaults to the STEAM_ID env. " +
+        "easiest achievements left to unlock and advise on them. get_wishlist shows what they want to " +
+        "buy, with current prices and discounts (and, with a GG.deals key, the cheapest official-store " +
+        "and keyshop prices plus all-time lows); get_game_deals does the same for any appids. steam_id defaults to the STEAM_ID env. " +
         "Profiles and game details must be set to Public for any of this to return data. " +
         "Hidden achievements only expose a name + rarity (Steam withholds their description until the " +
         "player unlocks them) — for those, look up a guide by the achievement name + game to explain " +

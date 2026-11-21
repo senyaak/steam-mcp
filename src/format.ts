@@ -8,7 +8,10 @@ import type {
   OwnedGame,
   PlayerAchievement,
   SchemaAchievement,
+  StoreItem,
+  WishlistItem,
 } from "./steam.js";
+import type { GgPrices } from "./ggdeals.js";
 
 /** Minutes -> a short "12.3h" / "45m" string. */
 export function playtime(minutes: number): string {
@@ -92,4 +95,96 @@ export function mergeAchievements(
 /** Round a percent to one decimal, tolerating undefined. */
 export function pct(v?: number): number | undefined {
   return v === undefined ? undefined : Math.round(v * 10) / 10;
+}
+
+const STORE_TYPE: Record<number, string> = {
+  0: "game",
+  1: "demo",
+  2: "mod",
+  3: "movie",
+  4: "dlc",
+  5: "music",
+  6: "software",
+};
+
+function isoDate(unixSeconds?: number): string | undefined {
+  return unixSeconds ? new Date(unixSeconds * 1000).toISOString().slice(0, 10) : undefined;
+}
+
+export interface DistilledWishlistItem {
+  appid: number;
+  name?: string;
+  type?: string;
+  /** Player's ranking, 1 = top; 0 = not ranked. */
+  priority: number;
+  added: string; // ISO date
+  /** false = delisted or not sold in this country. */
+  available?: boolean;
+  price?: string;
+  priceCents?: number;
+  originalPrice?: string;
+  discountPct?: number;
+  saleEnds?: string; // ISO date
+  released?: string; // ISO date
+  comingSoon?: string; // e.g. "Q1 2027", when not out yet
+  reviews?: string; // e.g. "Very Positive (82% of 4567)"
+  url: string;
+  /** GG.deals prices across stores; null = unknown to GG.deals. */
+  ggDeals?: DistilledGgPrices | null;
+}
+
+export function distillWishlistItem(w: WishlistItem, s?: StoreItem): DistilledWishlistItem {
+  const buy = s?.best_purchase_option;
+  const rv = s?.reviews?.summary_filtered;
+  const cents = buy?.final_price_in_cents ? Number(buy.final_price_in_cents) : undefined;
+  return {
+    appid: w.appid,
+    name: s?.name,
+    type: s?.type !== undefined ? (STORE_TYPE[s.type] ?? String(s.type)) : undefined,
+    priority: w.priority,
+    added: isoDate(w.date_added) ?? "",
+    available: s ? s.success === 1 : undefined,
+    price: buy?.formatted_final_price ?? (s?.is_free ? "Free" : undefined),
+    priceCents: cents ?? (s?.is_free ? 0 : undefined),
+    originalPrice: buy?.discount_pct ? buy.formatted_original_price : undefined,
+    discountPct: buy?.discount_pct || undefined,
+    saleEnds: buy?.discount_pct
+      ? isoDate(buy.active_discounts?.[0]?.discount_end_date)
+      : undefined,
+    released: s?.release?.is_coming_soon ? undefined : isoDate(s?.release?.steam_release_date),
+    comingSoon: s?.release?.is_coming_soon
+      ? (s.release.coming_soon_display ?? "coming soon")
+      : undefined,
+    reviews: rv?.review_score_label
+      ? `${rv.review_score_label} (${rv.percent_positive}% of ${rv.review_count})`
+      : undefined,
+    url: `https://store.steampowered.com/${s?.store_url_path ?? `app/${w.appid}`}`,
+  };
+}
+
+export interface DistilledGgPrices {
+  /** Cheapest price right now in official stores (Steam, GOG, Humble, …). */
+  retail: string | null;
+  /** Cheapest price right now in keyshops (grey-market key resellers). */
+  keyshops: string | null;
+  lowestRetail: string | null;
+  lowestKeyshops: string | null;
+  /** Current retail price is at (or below) its all-time low. */
+  retailAtHistoricalLow: boolean;
+  url: string;
+}
+
+export function distillGg(g: GgPrices): DistilledGgPrices {
+  const fmt = (v: number | null) => (v === null ? null : `${v.toFixed(2)} ${g.currency}`);
+  return {
+    retail: fmt(g.currentRetail),
+    keyshops: fmt(g.currentKeyshops),
+    lowestRetail: fmt(g.historicalRetail),
+    lowestKeyshops: fmt(g.historicalKeyshops),
+    retailAtHistoricalLow:
+      g.currentRetail !== null &&
+      g.historicalRetail !== null &&
+      g.currentRetail <= g.historicalRetail,
+    url: g.url,
+  };
 }

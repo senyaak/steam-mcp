@@ -50,6 +50,8 @@ cp .env.example .env   # then fill in your values
 | `STEAM_API_KEY` | yes | Your Steam Web API key. |
 | `STEAM_ID` | no | Default player. Without it, pass `steam_id` to each tool. |
 | `STEAM_LANG` | no | Language of achievement names and descriptions. Default: `english`. |
+| `STEAM_COUNTRY` | no | Store country (ISO code, e.g. `DE`) for wishlist prices and currency. Default: `US`. |
+| `GG_DEALS_API_KEY` | no | [GG.deals](https://gg.deals/api/prices/) key for cross-store and keyshop prices and all-time lows. |
 | `PORT` | no | HTTP port. Default: `3846`. |
 | `CACHE_DIR` | no | Where the app list is cached. Default: `<project>/.cache`. |
 
@@ -93,10 +95,26 @@ is required, and fails with *"Couldn't register…"*.
 | `get_owned_games` | `steam_id?`, `sort` (`playtime`\|`name`\|`recent`), `limit`, `played_only` | The whole library with playtime. |
 | `get_recently_played_games` | `steam_id?` | Games from the last 2 weeks, with recent and total playtime. |
 | `find_game` | `query`, `limit` | `appid` by name (exact, then prefix, then substring match). |
+| `get_wishlist` | `steam_id?`, `sort` (`priority`\|`added`\|`name`\|`price`\|`discount`), `on_sale_only`, `limit`, `gg_deals` | Wishlist with price, discount, sale end, release date, reviews, priority. |
+| `get_game_deals` | `appids` (up to 100) | GG.deals prices: cheapest official store, cheapest keyshop, all-time lows for both. |
 | `get_player_achievements` | `appid`, `steam_id?`, `filter` (`all`\|`locked`\|`unlocked`), `sort` (`rarity`\|`name`\|`unlock`), `limit` | A game's achievements: name, description, status and date, `hidden`, **global %**, plus a progress summary. |
 
 The most useful call is `get_player_achievements` with `filter=locked` and `sort=rarity`. It lists your
 remaining achievements from most common (usually easiest) to rarest.
+
+`get_wishlist` (`steam_id?`, `sort` (`priority`\|`added`\|`name`\|`price`\|`discount`), `on_sale_only`, `limit`)
+returns the wishlist with store details: price, discount and sale end date, release date or "coming soon",
+review score, your priority and the date added. It uses `IWishlistService/GetWishlist` for the appids and
+`IStoreBrowseService/GetItems` for the details; both are keyless. Prices are in the currency of
+`STEAM_COUNTRY`.
+
+With `GG_DEALS_API_KEY` set, each returned wishlist item also gets a `ggDeals` block: the cheapest
+price right now in official stores and in keyshops, the all-time lows for both, and whether the
+retail price is at its all-time low. GG.deals allows 100 games per minute and 1000 per hour (every
+appid counts), so only the returned page is enriched, prices are cached on disk for 6 hours, and a
+request is trimmed to the remaining rate limit. Keep `limit` small when you want these prices. The
+GG.deals region follows `STEAM_COUNTRY` and falls back to `us` for countries GG.deals doesn't cover.
+Price data comes from [GG.deals](https://gg.deals).
 
 ## Example prompts
 
@@ -106,6 +124,8 @@ remaining achievements from most common (usually easiest) to rarest.
 - "How many achievements are left in Baldur's Gate 3, and which are the rarest?"
 - "Find the appid for Hollow Knight and show my achievement progress."
 - "Of my recent games, which one am I closest to 100% in?"
+- "What from my wishlist is on sale right now, biggest discount first?"
+- "Which of my top 20 wishlist games are at their all-time low, and is a keyshop cheaper?"
 
 ## How it works
 
@@ -135,6 +155,7 @@ incomplete coverage.
 src/
 ├── index.ts    # MCP server, tool registration, Express + Streamable HTTP
 ├── steam.ts    # Steam Web API client
+├── ggdeals.ts  # GG.deals prices client (rate-limit aware, per-appid cache)
 ├── format.ts   # cleans up games, merges achievements (schema + status + rarity)
 └── cache.ts    # TTL cache with disk persistence
 ```
